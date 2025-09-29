@@ -26,19 +26,34 @@ use snarkvm::{
 };
 
 use indexmap::IndexMap;
-use std::{fmt, ops::Range, sync::Arc};
+use lru::LruCache;
+use parking_lot::Mutex;
+use std::{
+    fmt,
+    ops::Range,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
+/// The capacity of the LRU holiding the recently queried committees.
+const COMMITTEE_CACHE_SIZE: usize = 16;
 
 /// A core ledger service.
 pub struct CoreLedgerService<N: Network, C: ConsensusStorage<N>> {
     ledger: Ledger<N, C>,
     coinbase_verifying_key: Arc<CoinbaseVerifyingKey<N>>,
+    committee_cache: Arc<Mutex<LruCache<u64, Committee<N>>>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl<N: Network, C: ConsensusStorage<N>> CoreLedgerService<N, C> {
     /// Initializes a new core ledger service.
-    pub fn new(ledger: Ledger<N, C>) -> Self {
+    pub fn new(ledger: Ledger<N, C>, shutdown: Arc<AtomicBool>) -> Self {
         let coinbase_verifying_key = Arc::new(ledger.coinbase_puzzle().coinbase_verifying_key().clone());
-        Self { ledger, coinbase_verifying_key }
+        let committee_cache = Arc::new(Mutex::new(LruCache::new(COMMITTEE_CACHE_SIZE.try_into().unwrap())));
+        Self { ledger, coinbase_verifying_key, committee_cache, shutdown }
     }
 }
 
@@ -119,9 +134,19 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
     /// Returns the committee for the given round.
     /// If the given round is in the future, then the current committee is returned.
     fn get_committee_for_round(&self, round: u64) -> Result<Committee<N>> {
+        // Check if the committee is already in the cache.
+        if let Some(committee) = self.committee_cache.lock().get(&round) {
+            return Ok(committee.clone());
+        }
+
         match self.ledger.get_committee_for_round(round)? {
             // Return the committee if it exists.
-            Some(committee) => Ok(committee),
+            Some(committee) => {
+                // Insert the committee into the cache.
+                self.committee_cache.lock().push(round, committee.clone());
+                // Return the committee.
+                Ok(committee)
+            }
             // Return the current committee if the round is in the future.
             None => {
                 // Retrieve the current committee.
@@ -135,9 +160,9 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
         }
     }
 
-    /// Returns the previous committee for the given round.
-    /// If the previous round is in the future, then the current committee is returned.
-    fn get_previous_committee_for_round(&self, round: u64) -> Result<Committee<N>> {
+    /// Returns the committee lookback for the given round.
+    /// If the committee lookback round is in the future, then the current committee is returned.
+    fn get_committee_lookback_for_round(&self, round: u64) -> Result<Committee<N>> {
         // Get the round number for the previous committee. Note, we subtract 2 from odd rounds,
         // because committees are updated in even rounds.
         let previous_round = match round % 2 == 0 {
@@ -145,8 +170,11 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
             false => round.saturating_sub(2),
         };
 
-        // Retrieve the committee for the previous round.
-        self.get_committee_for_round(previous_round)
+        // Get the committee lookback round.
+        let committee_lookback_round = previous_round.saturating_sub(Committee::<N>::COMMITTEE_LOOKBACK_RANGE);
+
+        // Retrieve the committee for the committee lookback round.
+        self.get_committee_for_round(committee_lookback_round)
     }
 
     /// Returns `true` if the ledger contains the given certificate ID in block history.
@@ -163,8 +191,8 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
         }
     }
 
-    /// Ensures the given transmission ID matches the given transmission.
-    fn ensure_transmission_id_matches(
+    /// Ensures that the given transmission is not a fee and matches the given transmission ID.
+    fn ensure_transmission_is_well_formed(
         &self,
         transmission_id: TransmissionID<N>,
         transmission: &mut Transmission<N>,
@@ -174,12 +202,18 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
             (TransmissionID::Transaction(expected_transaction_id), Transmission::Transaction(transaction_data)) => {
                 match transaction_data.clone().deserialize_blocking() {
                     Ok(transaction) => {
+                        // Ensure the transaction ID matches the expected transaction ID.
                         if transaction.id() != expected_transaction_id {
                             bail!(
                                 "Received mismatching transaction ID  - expected {}, found {}",
                                 fmt_id(expected_transaction_id),
                                 fmt_id(transaction.id()),
                             );
+                        }
+
+                        // Ensure the transaction is not a fee transaction.
+                        if transaction.is_fee() {
+                            bail!("Received a fee transaction in a transmission");
                         }
 
                         // Update the transmission with the deserialized transaction.
@@ -283,6 +317,11 @@ impl<N: Network, C: ConsensusStorage<N>> LedgerService<N> for CoreLedgerService<
     /// Adds the given block as the next block in the ledger.
     #[cfg(feature = "ledger-write")]
     fn advance_to_next_block(&self, block: &Block<N>) -> Result<()> {
+        // If the Ctrl-C handler registered the signal, then skip advancing to the next block.
+        if self.shutdown.load(Ordering::Relaxed) {
+            bail!("Skipping advancing to block {} - The node is shutting down", block.height());
+        }
+        // Advance to the next block.
         self.ledger.advance_to_next_block(block)?;
         tracing::info!("\n\nAdvanced to block {} at round {} - {}\n", block.height(), block.round(), block.hash());
         Ok(())
